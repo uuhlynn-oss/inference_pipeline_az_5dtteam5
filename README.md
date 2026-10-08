@@ -1,384 +1,158 @@
-# Real-time Inference Pipeline
+# Real-time Traffic Data Pipeline
 
-Azure 기반 실시간 대중교통 혼잡도 예측 시스템의 **ML 추론 파이프라인**입니다.
-
-Stream Analytics에서 5분 단위로 집계된 실시간 대중교통 데이터를 입력으로 받아 추론에 필요한 Feature를 구성하고, Azure Machine Learning Endpoint를 호출하여 예측 결과를 PostgreSQL에 저장합니다.
-
----
+Azure 기반 실시간 대중교통 혼잡도 예측 및 알림 파이프라인입니다.
 
 ## Architecture
 
-```text id="9v7m0q"
-                 Real-time Data Pipeline
-                         │
-                         ▼
-                ┌─────────────────┐
-                │   Event Hub     │
-                │ Real-time Data  │
-                └────────┬────────┘
-                         │
-                         ▼
-                ┌─────────────────┐
-                │ Stream Analytics │
-                │                 │
-                │ Event-time      │
-                │ 5-min Window    │
-                │ Aggregation     │
-                └────────┬────────┘
-                         │
-                         │ Aggregated Features
-                         ▼
-                ┌─────────────────────┐
-                │  Inference Function │
-                │                     │
-                │ Input Validation    │
-                │ Feature Engineering │
-                └─────────┬───────────┘
-                          │
-                          │ Model Input
-                          ▼
-                ┌─────────────────────┐
-                │ Azure ML Endpoint   │
-                │                     │
-                │   ML Inference      │
-                └─────────┬───────────┘
-                          │
-                          │ Prediction
-                          ▼
-                ┌─────────────────────┐
-                │    PostgreSQL       │
-                │ prediction_result   │
-                └─────────────────────┘
-```
-
----
-
-## Role
-
-본 Repository는 전체 실시간 데이터 파이프라인에서 **ML 추론 직전부터 예측 결과 저장까지**를 담당합니다.
-
-### 주요 책임
-
-* Stream Analytics 집계 데이터 수신
-* 입력 데이터 검증
-* ML Feature Engineering
-* Azure Machine Learning Endpoint 호출
-* Prediction Result 처리
-* PostgreSQL 저장
-
----
-
-## End-to-End Flow
-
-```text id="4r3w4n"
-External Data
-      │
-      ▼
+```text
+External API
+   │
+   ▼
 Data Collection
-      │
-      ▼
-Event Hub
-      │
-      ▼
-Stream Analytics
-      │
-      │ 5-minute Aggregation
-      ▼
-Inference Function
-      │
-      ├── Input Validation
-      ├── Feature Engineering
-      │
-      ▼
-Azure ML Endpoint
-      │
-      │ Prediction
-      ▼
+   ├─ Realtime
+   │    └─ Seoul Citydata API
+   │
+   └─ Batch
+        ├─ Event API       (추후 구현)
+        ├─ Holiday API     (추후 구현)
+        └─ Social/X        (별도 수집 코드)
+   │
+   ▼
+Azure Event Hub
+   │
+   ▼
+Azure Stream Analytics
+   ├─ observation_5m
+   ├─ weather_history
+   ├─ predict-traffic
+   └─ subway-alert
+        │
+        ├───────────────┐
+        ▼               ▼
+Inference Function   Alert Function
+        │               │
+        ▼               ▼
+Azure ML            Microsoft Teams
+(6 Endpoints)
+        │
+        ▼
 PostgreSQL
-      │
-      ▼
-prediction_result
+   └─ prediction_result
+
+[UI]
+  └─ 추후 구현
 ```
 
----
+## Repository Structure
 
-# Stream Analytics Processing
-
-Stream Analytics에서는 실시간 BUS/SUBWAY 데이터를 **event time 기준 5분 Tumbling Window**로 집계합니다.
-
-### 주요 처리
-
-* `event_time` 기반 Event-time Processing
-* BUS / SUBWAY 데이터 필터링
-* `boarding`, `alighting` 데이터 품질 검증
-* 5분 Tumbling Window 집계
-* 위치 및 데이터 유형별 집계 결과 생성
-
-### Aggregation
-
-```text id="ndj57f"
-5-minute Tumbling Window
-          │
-          ├── sample_count
-          ├── traffic_sum_5m
-          ├── boarding_sum_5m
-          └── alighting_sum_5m
-```
-
-실제 Stream Analytics Query에서는 `TIMESTAMP BY event_time`을 사용하여 수집 시각이 아닌 **이벤트 발생 시각을 기준으로 Window를 구성**합니다.
-
-또한 `TRY_CAST`를 활용하여 승차 및 하차 데이터가 유효한 경우만 집계하도록 구성했습니다.
-
-예시:
-
-```sql id="y9j2b8"
-SELECT
-    source_id,
-    location_id,
-    data_type,
-    DATEADD(minute, -5, System.Timestamp()) AS window_start,
-    System.Timestamp() AS window_end,
-    CAST(COUNT(*) AS bigint) AS sample_count,
-
-    CAST(
-        SUM(
-            TRY_CAST(boarding AS bigint)
-            + TRY_CAST(alighting AS bigint)
-        ) AS bigint
-    ) AS traffic_sum_5m,
-
-    CAST(
-        SUM(TRY_CAST(boarding AS bigint))
-        AS bigint
-    ) AS boarding_sum_5m,
-
-    CAST(
-        SUM(TRY_CAST(alighting AS bigint))
-        AS bigint
-    ) AS alighting_sum_5m
-
-INTO [observation-5m-postgres]
-
-FROM [eh_raw]
-
-TIMESTAMP BY event_time
-
-WHERE
-    data_type IN ('BUS', 'SUBWAY')
-    AND TRY_CAST(boarding AS bigint) IS NOT NULL
-    AND TRY_CAST(alighting AS bigint) IS NOT NULL
-
-GROUP BY
-    source_id,
-    location_id,
-    data_type,
-    TumblingWindow(minute, 5);
-```
-
----
-
-# Inference Function
-
-Stream Analytics에서 생성된 집계 데이터를 기반으로 ML 추론에 필요한 입력 Feature를 구성합니다.
-
-```text id="8ep6cq"
-Aggregated Data
-      │
-      ▼
-Input Validation
-      │
-      ▼
-Feature Engineering
-      │
-      ▼
-Model Input
-      │
-      ▼
-Azure ML Endpoint
-```
-
-Inference Function은 모델 자체를 실행하는 것이 아니라 **실시간 데이터와 ML 모델 사이의 추론 오케스트레이션 역할**을 담당합니다.
-
----
-
-# Key Technical Decision
-
-## Feature Engineering을 Inference Function에 통합
-
-실시간 추론을 위해 별도의 Feature Engineering 서비스를 추가하는 대신, **Inference Function에서 ML 호출 직전에 필요한 Feature를 생성**하도록 설계했습니다.
-
-### 고려했던 구조
-
-```text id="e1t0yc"
-Stream Analytics
-       ↓
-Feature Engineering Service
-       ↓
-Inference Function
-       ↓
-Azure ML
-```
-
-### 최종 구조
-
-```text id="9u0z8k"
-Stream Analytics
-       ↓
-Inference Function
-       │
-       ├── Validation
-       ├── Feature Engineering
-       └── AML Request
-               ↓
-        Azure ML Endpoint
-```
-
-### 설계 목적
-
-* 추론 경로 단순화
-* 별도 전처리 서비스 운영 복잡도 감소
-* Feature 생성과 추론 요청의 일관성 확보
-* ML Endpoint 연동 단계 최소화
-
----
-
-# Prediction Result
-
-Azure ML Endpoint에서 반환된 예측 결과는 PostgreSQL의 `prediction_result` 테이블에 저장합니다.
-
-```text id="4qv9uy"
-Azure ML Endpoint
-       │
-       ▼
-Prediction Result
-       │
-       ▼
-PostgreSQL
-       │
-       ▼
-prediction_result
-```
-
-예측 결과는 이후 대시보드 및 의사결정 지원 시스템에서 조회할 수 있도록 관리합니다.
-
-### 주요 데이터
-
-| Field                | Description |
-| -------------------- | ----------- |
-| `location_id`        | 예측 대상 위치    |
-| `prediction_time`    | 예측 기준 시각    |
-| `prediction_horizon` | 예측 시점       |
-| `prediction_value`   | 모델 예측 결과    |
-| `created_at`         | 결과 생성 시각    |
-
----
-
-# Tech Stack
-
-| Technology                    | Role                                      |
-| ----------------------------- | ----------------------------------------- |
-| Python                        | Application / Data Processing             |
-| Azure Functions               | Inference Orchestration                   |
-| Azure Stream Analytics        | Event-time Processing & 5-min Aggregation |
-| Azure Machine Learning        | ML Model Inference                        |
-| Azure Database for PostgreSQL | Prediction Result Storage                 |
-
----
-
-# Project Structure
-
-```text id="a3n0ds"
+```text
 .
-├── function_app.py       # Inference Function
-├── host.json             # Azure Functions Host configuration
-├── requirements.txt      # Python dependencies
-├── .funcignore           # Azure Functions deployment exclusions
-└── .gitignore            # Git exclusions
+├── data_collection/
+│   ├── realtime/
+│   │   └── realtime_collection.py
+│   │
+│   └── batch/
+│       ├── event/
+│       │   └── README.md
+│       ├── holiday/
+│       │   └── README.md
+│       ├── social/
+│       │   └── collect_x_posts_cdp.py
+│       └── README.md
+│
+├── stream_analytics/
+│   └── SA_Query.sql
+│
+├── functions/
+│   ├── inference/
+│   │   ├── function_app.py
+│   │   ├── host.json
+│   │   └── requirements.txt
+│   │
+│   └── alert/
+│       ├── function_app.py
+│       ├── host.json
+│       └── requirements.txt
+│
+├── aml/
+│   └── README.md
+│
+├── database/
+│   └── README.md
+│
+├── notebooks/
+│   └── realtime_e2e_validation.ipynb
+│
+└── ui/
+    └── README.md
 ```
 
----
+## Main Flow
 
-# Local Development
+### 1. Realtime Data Collection
 
-## 1. Create Virtual Environment
+Seoul Citydata API에서 버스·지하철 실시간 데이터를 수집하고, 날씨 및 이벤트 정보를 함께 처리하는 기존 수집 코드를 `data_collection/realtime/`에 통합했습니다.
 
-```bash id="1k2t7a"
-python -m venv .venv
-```
+### 2. Stream Analytics
 
-Windows:
+Event Hub의 원천 데이터를 event time 기준 5분 Tumbling Window로 집계합니다.
 
-```bash id="7k8f4d"
-.venv\Scripts\activate
-```
+주요 Output:
 
-## 2. Install Dependencies
+- `observation-5m-postgres`
+- `weather_history_postgres`
+- `predict-traffic`
+- `subway-alert`
 
-```bash id="v5g3z2"
-pip install -r requirements.txt
-```
+### 3. Inference Function
 
-## 3. Configure Environment
+`predict-traffic`를 입력으로 받아:
 
-Azure resource connection information and secrets should be configured through `local.settings.json` or environment variables.
+1. 입력 검증
+2. PostgreSQL에서 Weather / Event / Holiday 조회
+3. Feature Engineering
+4. BUS / SUBWAY 예측 Job 생성
+5. Azure ML Endpoint 호출
+6. `prediction_result` 저장
 
-`local.settings.json` is excluded from Git to prevent credentials and connection information from being committed.
+을 수행합니다.
 
-## 4. Run Azure Function
+현재 통합된 버전은 PostgreSQL Weather/Event/Holiday 데이터를 먼저 벌크 조회하고, Azure ML 최대 6개 Endpoint 호출을 `ThreadPoolExecutor`로 병렬 처리합니다.
 
-```bash id="f7q1xm"
-func start
-```
+### 4. Alert Function
 
----
+Stream Analytics의 `subway-alert` Output을 받아 Microsoft Teams Webhook으로 승하차량 급증 알림을 전송합니다.
 
-# E2E Validation
+알림 임계값 판단은 Stream Analytics에서 수행합니다.
 
-Mock 기반으로 다음 전체 추론 경로를 검증했습니다.
+## Azure ML
 
-```text id="z1x7cw"
-Stream Analytics
-       ↓
-Inference Function
-       ↓
-Feature Engineering
-       ↓
-Azure ML Inference
-       ↓
-PostgreSQL
-```
+AML은 실제 프로젝트의 핵심 구성요소이지만, 이번 Repository 통합에서는 모델 및 Endpoint 관련 산출물을 아직 추가하지 않고 `aml/` 디렉터리만 구성했습니다.
 
-### Validation
+Inference Function은 다음 6개 Endpoint를 환경변수로 참조합니다.
 
-* Stream Analytics 집계 데이터 전달 검증
-* Inference Function 입력 처리 검증
-* Feature Engineering 검증
-* ML Inference 요청/응답 흐름 검증
-* Prediction Result PostgreSQL 적재 확인
+- BUS: current / 1h / 2h
+- SUBWAY: current / 1h / 2h
 
-현재 Mock 기반 E2E 검증을 완료했으며, 실제 Azure ML Endpoint 배포 후 Production 환경에서 최종 검증을 진행합니다.
+## Batch Data Collection
 
----
+현재 제공된 소스에는 메인 프로젝트의 Event API / Holiday API 배치 수집 구현이 없습니다. 따라서 해당 디렉터리 구조만 먼저 구성했습니다.
 
-# Related Repository
+`collect_x_posts_cdp.py`는 서울교통공사 및 서울시 교통정보센터 TOPIS 공식 X 게시물을 수집하는 별도 배치성 수집 코드로 `data_collection/batch/social/`에 보관했습니다.
 
-본 Repository는 전체 실시간 데이터 파이프라인 중 **Inference 단계**를 담당합니다.
+## UI
 
-```text id="p0w3mz"
-[Data Collection]
-       ↓
-[Event Hub]
-       ↓
-[Stream Analytics]
-       ↓
-┌────────────────────────┐
-│  Real-time Inference   │
-│     This Repository    │
-└───────────┬────────────┘
-            ↓
-       [Azure ML]
-            ↓
-       [PostgreSQL]
-```
+UI는 백엔드 데이터 파이프라인 통합 이후 마지막 단계에서 구현합니다. 현재 Repository에는 UI 구현 코드를 포함하지 않습니다.
 
-전체 데이터 수집 및 Streaming Pipeline은 별도의 Repository에서 관리합니다.
+## Security
+
+API Key, Azure ML Endpoint Key, PostgreSQL Password, Teams Webhook URL 등 비밀값은 환경변수 또는 Azure 설정을 통해 주입하며 Repository에 직접 저장하지 않습니다.
+
+## Deployment
+
+Azure Functions는 Function App 단위로 배포할 수 있도록 Inference와 Alert를 별도 디렉터리로 분리했습니다.
+
+- `functions/inference/`
+- `functions/alert/`
+
+각 디렉터리는 독립적인 `host.json`과 `requirements.txt`를 가집니다.
