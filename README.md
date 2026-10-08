@@ -81,7 +81,7 @@ PostgreSQL
 │   └── README.md
 │
 ├── notebooks/
-│   └── realtime_e2e_validation.ipynb
+│   └── README.md
 │
 └── ui/
     └── README.md
